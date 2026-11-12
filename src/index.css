@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+/* Leaflet dark styling for maritime control room */
+.leaflet-container {
+  background-color: #0f172a;
+  font-family: inherit;
+}
+
+.leaflet-tile-pane {
+  filter: brightness(0.7) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.75);
+}
+
+.leaflet-popup-content-wrapper, .leaflet-popup-tip {
+  background-color: #020617 !important;
+  color: #f1f5f9 !important;
+  border: 1px solid #1e293b !important;
+  border-radius: 8px !important;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.7) !important;
+}
+
+.leaflet-popup-content {
+  margin: 10px 12px !important;
+  line-height: 1.4 !important;
+}
+
+.leaflet-control-zoom a {
+  background-color: #0f172a !important;
+  color: #38bdf8 !important;
+  border-color: #1e293b !important;
+}
+
+.leaflet-control-zoom a:hover {
+  background-color: #1e293b !important;
+  color: #7dd3fc !important;
+}
+
+.custom-port-icon {
+  background: transparent;
+  border: none;
+}
+
+.vessel-marker-div {
+  background: transparent;
+  border: none;
+}
