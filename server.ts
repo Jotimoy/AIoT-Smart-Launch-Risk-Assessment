@@ -607,7 +607,11 @@ CREATE TABLE IF NOT EXISTS \`alerts\` (
 });
 
 // Endpoint to download the updated ESP32 Arduino firmware file
-app.get('/firmware/smart_launch_esp32.ino', (req: Request, res: Response) => {
+app.get('/firmware/smart_launch_esp32.ino', (req: Request, res: Response, next) => {
+  if ('import' in req.query || 'raw' in req.query) {
+    return next();
+  }
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.sendFile(path.join(__dirname, 'firmware', 'smart_launch_esp32.ino'));
 });
 

@@ -16,6 +16,7 @@ import { CalibrationView } from './views/CalibrationView';
 import { SettingsView } from './views/SettingsView';
 import { HardwareDocsView } from './views/HardwareDocsView';
 import { buzzerAudio } from './utils/buzzerAudio';
+import { webSerialBridge } from './utils/webSerialBridge';
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<ActiveTab>('dashboard');
@@ -282,6 +283,7 @@ export default function App() {
   };
 
   const handleSendCommand = (cmd: string) => {
+    webSerialBridge.sendCommand(cmd);
     fetch('/api/device/command', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -166,6 +166,7 @@ const char *buzzerStatus = "OFF";
 
 unsigned long lastOutputMs = 0;
 unsigned long lastTelemetryMs = 0;
+unsigned long lastWifiReconnectMs = 0;
 
 // Forward Declarations
 void setBuzzer(bool enabled);
@@ -440,7 +441,8 @@ void recordEntryEvent() {
   totalEntries++;
   passengerCount++;
   savePassengerCounts();
-  Serial.printf("\n*** ENTRY DETECTED: PASSENGER +1 (Total Onboard: %d, Entries: %d) ***\n", passengerCount, totalEntries);
+  Serial.printf("\n*** ENTRY DETECTED: PASSENGER +1 (Total Onboard: %lu, Entries: %lu) ***\n",
+                (unsigned long)passengerCount, (unsigned long)totalEntries);
 }
 
 void recordExitEvent() {
@@ -451,7 +453,8 @@ void recordExitEvent() {
     unmatchedExitEvents++;
   }
   savePassengerCounts();
-  Serial.printf("\n*** EXIT DETECTED: PASSENGER -1 (Total Onboard: %d, Exits: %d) ***\n", passengerCount, totalExits);
+  Serial.printf("\n*** EXIT DETECTED: PASSENGER -1 (Total Onboard: %lu, Exits: %lu) ***\n",
+                (unsigned long)passengerCount, (unsigned long)totalExits);
 }
 
 void processGateDetector(GateDetector &gate, float distanceCm, bool isEntryGate) {
@@ -562,18 +565,12 @@ void handleSerialCommands() {
 }
 
 // ============================================================
-// WEB TELEMETRY TRANSMITTER (HTTP POST to /api/telemetry)
+// WEB TELEMETRY TRANSMITTER (USB Serial + HTTP POST to /api/telemetry)
 // ============================================================
 void sendTelemetryToWebServer() {
   const unsigned long now = millis();
   if (now - lastTelemetryMs < TELEMETRY_SEND_INTERVAL_MS) return;
   lastTelemetryMs = now;
-
-  if (WiFi.status() != WL_CONNECTED) {
-    // Attempt auto reconnect
-    WiFi.reconnect();
-    return;
-  }
 
   const float totalWeightG = leftWeightG + rightWeightG;
   const float differenceG = fabs(leftWeightG - rightWeightG);
@@ -589,24 +586,24 @@ void sendTelemetryToWebServer() {
   json += "\"passengerCount\":" + String(passengerCount) + ",";
   json += "\"entryCount\":" + String(totalEntries) + ",";
   json += "\"exitCount\":" + String(totalExits) + ",";
-  
-  // Weights (Send both grams and kg)
+
+  // Weights in grams (prototype scale)
   json += "\"leftLoad\":" + String(leftWeightG, 2) + ",";
   json += "\"rightLoad\":" + String(rightWeightG, 2) + ",";
   json += "\"totalLoad\":" + String(totalWeightG, 2) + ",";
   json += "\"loadImbalancePercent\":" + String(imbalancePercent, 1) + ",";
   json += "\"dualHX711Connected\":true,";
-  
+
   // Angles & Motion
   json += "\"roll\":" + String(rollDeg, 2) + ",";
   json += "\"pitch\":" + String(pitchDeg, 2) + ",";
   json += "\"gyroX\":" + String(gyroXRateDps, 2) + ",";
   json += "\"gyroY\":" + String(gyroYRateDps, 2) + ",";
-  
+
   // Water
   json += "\"waterLevelRaw\":" + String(waterRaw) + ",";
   json += "\"waterLevelPercent\":" + String(waterCoveragePercent, 1) + ",";
-  
+
   // GPS
   json += "\"gps\":{";
   if (gpsFixValid) {
@@ -625,10 +622,10 @@ void sendTelemetryToWebServer() {
     json += "\"satellites\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0);
   }
   json += "},";
-  
+
   // Hardware status
   json += "\"hardwareHealth\":{";
-  json += "\"esp32Wifi\":true,";
+  json += "\"esp32Wifi\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
   json += "\"entryUltrasonic\":" + String(entryDistanceCm >= 0 ? "true" : "false") + ",";
   json += "\"exitUltrasonic\":" + String(exitDistanceCm >= 0 ? "true" : "false") + ",";
   json += "\"loadCellAmplifier\":" + String((leftScaleValid && rightScaleValid) ? "true" : "false") + ",";
@@ -638,10 +635,23 @@ void sendTelemetryToWebServer() {
   json += "\"activeBuzzer\":true";
   json += "}}";
 
+  // Always stream structured JSON line over USB Serial for direct browser Web Serial Bridge
+  Serial.println("TELEMETRY_JSON:" + json);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastWifiReconnectMs > 10000UL) {
+      lastWifiReconnectMs = now;
+      WiFi.reconnect();
+    }
+    return;
+  }
+
   HTTPClient http;
+  http.setTimeout(2500);
   WiFiClientSecure secureClient;
-  if (strncmp(SERVER_URL, "https://", 8) == 0) {
-    secureClient.setInsecure(); // Connect securely to Cloud App without CA cert maintenance
+  String urlStr = String(SERVER_URL);
+  if (urlStr.startsWith("https://")) {
+    secureClient.setInsecure();
     http.begin(secureClient, SERVER_URL);
   } else {
     http.begin(SERVER_URL);
@@ -651,15 +661,29 @@ void sendTelemetryToWebServer() {
 
   if (code == 200) {
     String response = http.getString();
-    // Check if web console queued a command for this ESP32
-    int cmdIdx = response.indexOf("\"pendingCommand\":");
-    if (cmdIdx > 0) {
-      char remoteCmd = response.charAt(cmdIdx + 18);
-      if (remoteCmd == 'd' || remoteCmd == 'w' || remoteCmd == 't' || remoteCmd == 'm' || remoteCmd == 'z') {
-        Serial.printf("[WEB COMMAND RECEIVED]: '%c'\n", remoteCmd);
-        executeCommand(remoteCmd);
+    if (response.startsWith("<")) {
+      Serial.println("[HTTP] Warning: Server returned HTML auth page. Use USB Web Serial Bridge or Local IP.");
+    } else {
+      int cmdIdx = response.indexOf("\"pendingCommand\"");
+      if (cmdIdx >= 0) {
+        int colonIdx = response.indexOf(':', cmdIdx);
+        if (colonIdx > 0) {
+          int quoteStart = response.indexOf('"', colonIdx + 1);
+          int nullStart = response.indexOf("null", colonIdx + 1);
+          if (quoteStart > 0 && (nullStart < 0 || quoteStart < nullStart)) {
+            char remoteCmd = response.charAt(quoteStart + 1);
+            if (remoteCmd == 'd' || remoteCmd == 'w' || remoteCmd == 't' || remoteCmd == 'm' || remoteCmd == 'z') {
+              Serial.printf("[WEB COMMAND RECEIVED]: '%c'\n", remoteCmd);
+              executeCommand(remoteCmd);
+            }
+          }
+        }
       }
     }
+  } else if (code > 0) {
+    Serial.printf("[HTTP] POST status: %d\n", code);
+  } else {
+    Serial.printf("[HTTP] Connection failed (%d). USB Serial streaming remains active.\n", code);
   }
   http.end();
 }
@@ -672,14 +696,12 @@ void printMonitoringData() {
 
   const float totalWeightG = leftWeightG + rightWeightG;
   const float weightDifferenceG = fabs(leftWeightG - rightWeightG);
-  float leftLoadPercent = 0.0f, rightLoadPercent = 0.0f, imbalancePercent = 0.0f;
+  float imbalancePercent = 0.0f;
 
   const bool validDistribution = leftScaleValid && rightScaleValid &&
       leftWeightG >= 0.0f && rightWeightG >= 0.0f && totalWeightG >= NO_LOAD_THRESHOLD_G;
 
   if (validDistribution) {
-    leftLoadPercent = (leftWeightG / totalWeightG) * 100.0f;
-    rightLoadPercent = (rightWeightG / totalWeightG) * 100.0f;
     imbalancePercent = (weightDifferenceG / totalWeightG) * 100.0f;
   }
 
@@ -693,10 +715,10 @@ void printMonitoringData() {
                 pitchDeg, rollDeg, (mpuValid ? (fabs(rollDeg) > TILT_CRITICAL_DEG ? "HIGH TILT" : "NORMAL") : "IMU ERROR"));
   Serial.printf("[WATER]  ADC: %d | Coverage: %.1f%% | Status: %s\n",
                 waterRaw, waterCoveragePercent, (waterCalibrationValid ? (waterCoveragePercent > WATER_WARNING_PERCENT ? "WARNING" : "DRY") : "NOT CALIBRATED"));
-  Serial.printf("[GPS]    Status: %s | Lat: %.6f | Lng: %.6f | Sats: %d\n",
-                (gpsFixValid ? "3D FIXED" : "SEARCHING"), (gpsFixValid ? gps.location.lat() : 0.0), (gpsFixValid ? gps.location.lng() : 0.0), gps.satellites.value());
-  Serial.printf("[GATES]  In: %d | Out: %d | Onboard Passengers: %d\n",
-                totalEntries, totalExits, passengerCount);
+  Serial.printf("[GPS]    Status: %s | Lat: %.6f | Lng: %.6f | Sats: %lu\n",
+                (gpsFixValid ? "3D FIXED" : "SEARCHING"), (gpsFixValid ? gps.location.lat() : 0.0), (gpsFixValid ? gps.location.lng() : 0.0), (unsigned long)gps.satellites.value());
+  Serial.printf("[GATES]  In: %lu | Out: %lu | Onboard Passengers: %lu\n",
+                (unsigned long)totalEntries, (unsigned long)totalExits, (unsigned long)passengerCount);
   Serial.println("================================================");
 }
 
