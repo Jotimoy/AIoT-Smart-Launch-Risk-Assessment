@@ -292,7 +292,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-cyan-500 selection:text-black">
+    <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#0B1120] text-[#0F172A] dark:text-[#F8FAFC] flex flex-col font-sans antialiased selection:bg-cyan-500 selection:text-white dark:selection:text-black transition-colors duration-200">
       {/* Navbar with Mode switcher & Tabs */}
       <Navbar
         currentTab={currentTab}
@@ -378,7 +378,7 @@ export default function App() {
       />
 
       {/* Footer */}
-      <footer className="bg-slate-950 border-t border-slate-900 py-3 text-center text-xs text-slate-500 font-mono">
+      <footer className="bg-white dark:bg-[#0B1120] border-t border-[#E2E8F0] dark:border-[#334155] py-3 text-center text-xs text-[#64748B] dark:text-[#94A3B8] font-mono transition-colors duration-200">
         <div className="max-w-7xl mx-auto px-4 flex flex-wrap justify-between items-center gap-2">
           <span>AIoT Smart Launch Overcrowding Detection &amp; Safety Risk Assessment System</span>
           <span>Sadarghat &bull; Buriganga &bull; Meghna River Corridor &bull; ESP32 &amp; NEO-6M GNSS</span>

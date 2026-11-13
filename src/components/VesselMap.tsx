@@ -24,7 +24,6 @@ export const VesselMap: React.FC<VesselMapProps> = ({
   const markerRef = useRef<L.Marker | null>(null);
   const polylineRef = useRef<L.Polyline | null>(null);
 
-  // Default coordinate if GPS has no fix yet: Sadarghat Launch Terminal, Dhaka
   const defaultLat = 23.7042;
   const defaultLng = 90.4183;
 
@@ -35,22 +34,23 @@ export const VesselMap: React.FC<VesselMapProps> = ({
     if (!mapContainerRef.current) return;
 
     if (!mapInstanceRef.current) {
-      // Initialize Leaflet map
       const map = L.map(mapContainerRef.current, {
         center: [lat, lng],
         zoom: 12,
-        zoomControl: interactive,
+        zoomControl: false,
         dragging: interactive,
         scrollWheelZoom: interactive ? 'center' : false
       });
 
-      // Standard OpenStreetMap tiles (100% free, no API key required, full Bangladesh river coverage)
+      if (interactive) {
+        L.control.zoom({ position: 'bottomright' }).addTo(map);
+      }
+
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         maxZoom: 19
       }).addTo(map);
 
-      // Add major terminal markers along Bangladesh river route
       const terminals = [
         { name: 'Sadarghat Launch Terminal', lat: 23.7042, lng: 90.4183, desc: 'Dhaka Main River Port' },
         { name: 'Narayanganj River Port', lat: 23.6200, lng: 90.5050, desc: 'Shitalakshya River' },
@@ -61,14 +61,14 @@ export const VesselMap: React.FC<VesselMapProps> = ({
       terminals.forEach(term => {
         const portIcon = L.divIcon({
           className: 'custom-port-icon',
-          html: `<div class="w-3 h-3 rounded-full bg-cyan-400 border-2 border-slate-900 shadow-sm"></div>`,
+          html: `<div class="w-3 h-3 rounded-full bg-cyan-500 border-2 border-white dark:border-slate-900 shadow-sm"></div>`,
           iconSize: [12, 12],
           iconAnchor: [6, 6]
         });
 
         L.marker([term.lat, term.lng], { icon: portIcon })
           .addTo(map)
-          .bindPopup(`<strong>${term.name}</strong><br/><span style="font-size:11px;color:#94a3b8">${term.desc}</span>`);
+          .bindPopup(`<strong>${term.name}</strong><br/><span style="font-size:11px;opacity:0.75">${term.desc}</span>`);
       });
 
       mapInstanceRef.current = map;
@@ -76,11 +76,10 @@ export const VesselMap: React.FC<VesselMapProps> = ({
 
     const map = mapInstanceRef.current;
 
-    // Custom Vessel Marker with heading indicator and risk color ring
     const markerColor =
       riskStatus === 'CRITICAL' ? '#f43f5e' :
       riskStatus === 'HIGH RISK' ? '#f97316' :
-      riskStatus === 'WARNING' ? '#f59e0b' : '#06b6d4';
+      riskStatus === 'WARNING' ? '#f59e0b' : '#0891b2';
 
     const vesselHeading = gps.course ?? 145;
 
@@ -107,7 +106,7 @@ export const VesselMap: React.FC<VesselMapProps> = ({
       markerRef.current.bindPopup(`
         <div style="font-family: sans-serif; min-width: 160px;">
           <strong style="color: #0284c7;">${vesselName}</strong><br/>
-          <div style="font-size: 11px; margin-top: 4px; color: #334155;">
+          <div style="font-size: 11px; margin-top: 4px; opacity: 0.85;">
             GPS Fix: ${gps.fixValid ? 'Locked (3D)' : 'No Fix'}<br/>
             Speed: ${gps.speedKmh ? gps.speedKmh + ' km/h' : '0 km/h'}<br/>
             Heading: ${gps.course ? gps.course + '°' : 'N/A'}<br/>
@@ -120,16 +119,15 @@ export const VesselMap: React.FC<VesselMapProps> = ({
       markerRef.current.setIcon(vesselIcon);
     }
 
-    // Historical Route Trail
     const latLngs: [number, number][] = routeHistory.length > 0
       ? routeHistory.map(p => [p.latitude, p.longitude])
       : [[lat, lng]];
 
     if (!polylineRef.current) {
       polylineRef.current = L.polyline(latLngs, {
-        color: '#06b6d4',
+        color: '#0891b2',
         weight: 3.5,
-        opacity: 0.75,
+        opacity: 0.85,
         dashArray: '6, 6'
       }).addTo(map);
     } else {
@@ -139,13 +137,8 @@ export const VesselMap: React.FC<VesselMapProps> = ({
     if (gps.fixValid) {
       map.panTo([lat, lng], { animate: true, duration: 0.8 });
     }
-
-    return () => {
-      // Map cleanup handled on component unmount
-    };
   }, [lat, lng, gps, vesselName, riskStatus, routeHistory, interactive]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (mapInstanceRef.current) {
@@ -156,44 +149,43 @@ export const VesselMap: React.FC<VesselMapProps> = ({
   }, []);
 
   return (
-    <div className="relative rounded-xl overflow-hidden border border-slate-800 shadow-md">
-      {/* Map container */}
+    <div className="relative isolate z-0 rounded-xl overflow-hidden border border-[#E2E8F0] dark:border-[#334155] shadow-sm dark:shadow-md">
       <div ref={mapContainerRef} style={{ height, width: '100%' }} />
 
       {/* GPS Status HUD Overlay */}
-      <div className="absolute top-2 left-2 z-[400] bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-xs font-mono shadow-lg flex items-center gap-3">
+      <div className="absolute top-2 left-2 z-[400] bg-white/90 dark:bg-[#0B1120]/85 backdrop-blur-md px-3 py-1.5 rounded-lg border border-[#E2E8F0] dark:border-[#334155] text-xs font-mono shadow-md flex items-center gap-3">
         <div className="flex items-center gap-1.5">
           <span className={`w-2.5 h-2.5 rounded-full ${
-            gps.fixValid ? 'bg-emerald-400 animate-pulse' :
-            gps.isStale ? 'bg-amber-400' : 'bg-rose-500'
+            gps.fixValid ? 'bg-emerald-500 dark:bg-emerald-400 animate-pulse' :
+            gps.isStale ? 'bg-amber-500 dark:bg-amber-400' : 'bg-rose-500'
           }`}></span>
-          <span className="font-semibold text-slate-200">
+          <span className="font-semibold text-[#0F172A] dark:text-slate-200">
             {gps.fixValid ? 'GPS FIX 3D' : gps.isStale ? 'GPS STALE' : 'SEARCHING SATELLITES'}
           </span>
         </div>
-        <div className="text-slate-400 border-l border-slate-800 pl-3">
-          Sats: <span className="text-cyan-400 font-bold">{gps.satellites ?? 0}</span>
+        <div className="text-[#64748B] dark:text-slate-400 border-l border-[#E2E8F0] dark:border-[#334155] pl-3">
+          Sats: <span className="text-cyan-700 dark:text-cyan-400 font-bold">{gps.satellites ?? 0}</span>
         </div>
-        <div className="text-slate-400 border-l border-slate-800 pl-3">
-          Speed: <span className="text-slate-200 font-bold">{gps.speedKmh ? `${gps.speedKmh} km/h` : '0.0'}</span>
+        <div className="text-[#64748B] dark:text-slate-400 border-l border-[#E2E8F0] dark:border-[#334155] pl-3">
+          Speed: <span className="text-[#0F172A] dark:text-slate-200 font-bold">{gps.speedKmh ? `${gps.speedKmh} km/h` : '0.0'}</span>
         </div>
       </div>
 
       {/* Lat/Lng Coordinates HUD Overlay */}
-      <div className="absolute bottom-2 left-2 z-[400] bg-slate-950/85 backdrop-blur-md px-3 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-slate-300 shadow-lg">
+      <div className="absolute bottom-2 left-2 z-[400] bg-white/90 dark:bg-[#0B1120]/85 backdrop-blur-md px-3 py-1 rounded-lg border border-[#E2E8F0] dark:border-[#334155] text-[11px] font-mono text-[#64748B] dark:text-slate-300 shadow-md">
         {gps.latitude !== null && gps.longitude !== null ? (
           <span>
-            LAT: <strong className="text-cyan-400">{gps.latitude.toFixed(5)}°N</strong> &nbsp;|&nbsp;
-            LNG: <strong className="text-cyan-400">{gps.longitude.toFixed(5)}°E</strong> &nbsp;|&nbsp;
-            COURSE: <strong className="text-slate-100">{gps.course ? `${gps.course}°` : '145°'}</strong>
+            LAT: <strong className="text-cyan-700 dark:text-cyan-400">{gps.latitude.toFixed(5)}°N</strong> &nbsp;|&nbsp;
+            LNG: <strong className="text-cyan-700 dark:text-cyan-400">{gps.longitude.toFixed(5)}°E</strong> &nbsp;|&nbsp;
+            COURSE: <strong className="text-[#0F172A] dark:text-slate-100">{gps.course ? `${gps.course}°` : '145°'}</strong>
           </span>
         ) : (
-          <span className="text-amber-400">Waiting for NEO-6M NMEA sentence lock...</span>
+          <span className="text-amber-700 dark:text-amber-400">Waiting for NEO-6M NMEA sentence lock...</span>
         )}
       </div>
 
       {/* River Route Badge */}
-      <div className="absolute top-2 right-2 z-[400] bg-slate-950/85 backdrop-blur-md px-2.5 py-1 rounded-lg border border-slate-800 text-[10px] font-mono text-slate-300">
+      <div className="absolute top-2 right-2 z-[400] bg-white/90 dark:bg-[#0B1120]/85 backdrop-blur-md px-2.5 py-1 rounded-lg border border-[#E2E8F0] dark:border-[#334155] text-[10px] font-mono text-[#0F172A] dark:text-slate-300 shadow-sm">
         🚢 Dhaka Sadarghat ↔ Chandpur Route
       </div>
     </div>

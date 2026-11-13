@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { SensorTelemetry, VesselConfig } from '../types/iot';
-import { BarChart3, Download, TrendingUp, Users, Compass, Waves, ShieldAlert } from 'lucide-react';
+import { BarChart3, Download, Users, Compass, Waves, ShieldAlert } from 'lucide-react';
 
 interface AnalyticsViewProps {
   history: SensorTelemetry[];
@@ -12,7 +12,6 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ history, config })
 
   const records = history.length > 0 ? history : [];
 
-  // Compute key statistics
   const peakPassengers = records.reduce((max, r) => Math.max(max, r.passengerCount), 0);
   const maxRoll = records.reduce((max, r) => Math.max(max, Math.abs(r.roll)), 0);
   const maxWater = records.reduce((max, r) => Math.max(max, r.waterLevelPercent ?? 0), 0);
@@ -71,7 +70,6 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ history, config })
     URL.revokeObjectURL(url);
   };
 
-  // SVG Chart path generator
   const getMetricData = () => {
     switch (selectedMetric) {
       case 'risk':
@@ -106,21 +104,21 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ history, config })
   return (
     <div className="space-y-6">
       {/* Top Bar with Export */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+      <div className="bg-white dark:bg-[#111827] border border-[#E2E8F0] dark:border-[#334155] rounded-xl p-4 shadow-sm dark:shadow">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h2 className="text-base font-bold text-white tracking-wide flex items-center gap-2">
-              <BarChart3 className="w-5 h-5 text-cyan-400" />
-              Voyage Historical Analytics & Safety Trends
+            <h2 className="text-base font-bold text-[#0F172A] dark:text-white tracking-wide flex items-center gap-2">
+              <BarChart3 className="w-5 h-5 text-cyan-600 dark:text-cyan-400" />
+              Voyage Historical Analytics &amp; Safety Trends
             </h2>
-            <p className="text-xs text-slate-400 mt-0.5 font-mono">
+            <p className="text-xs text-[#64748B] dark:text-[#94A3B8] mt-0.5 font-mono">
               Temporal logs for post-voyage audit, BIWTA safety compliance, and ML model training.
             </p>
           </div>
 
           <button
             onClick={handleExportCSV}
-            className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-mono text-xs font-bold flex items-center gap-1.5 shadow transition"
+            className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-mono text-xs font-bold flex items-center gap-1.5 shadow transition cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
             Export Telemetry CSV
@@ -130,68 +128,68 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ history, config })
 
       {/* Aggregate KPI Summary Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-        <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-xs text-slate-400 font-mono">
+        <div className="bg-white dark:bg-[#111827] border border-[#E2E8F0] dark:border-[#334155] rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-xs text-[#64748B] dark:text-[#94A3B8] font-mono">
             <span>Peak Passengers</span>
-            <Users className="w-4 h-4 text-cyan-400" />
+            <Users className="w-4 h-4 text-cyan-600 dark:text-cyan-400" />
           </div>
-          <div className="text-2xl font-black text-white font-mono mt-2">
+          <div className="text-2xl font-black text-[#0F172A] dark:text-white font-mono mt-2">
             {peakPassengers}
           </div>
-          <span className="text-[10px] text-slate-400 font-mono">
+          <span className="text-[10px] text-[#64748B] dark:text-[#94A3B8] font-mono">
             Avg: {avgPassengers} | Limit: {config.maxPassengerCapacity}
           </span>
         </div>
 
-        <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-xs text-slate-400 font-mono">
+        <div className="bg-white dark:bg-[#111827] border border-[#E2E8F0] dark:border-[#334155] rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-xs text-[#64748B] dark:text-[#94A3B8] font-mono">
             <span>Max Roll Angle</span>
-            <Compass className="w-4 h-4 text-amber-400" />
+            <Compass className="w-4 h-4 text-amber-600 dark:text-amber-400" />
           </div>
-          <div className="text-2xl font-black text-amber-300 font-mono mt-2">
+          <div className="text-2xl font-black text-amber-700 dark:text-amber-300 font-mono mt-2">
             {maxRoll.toFixed(1)}°
           </div>
-          <span className="text-[10px] text-slate-400 font-mono">
+          <span className="text-[10px] text-[#64748B] dark:text-[#94A3B8] font-mono">
             Critical Threshold: {config.criticalRollAngle}°
           </span>
         </div>
 
-        <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-xs text-slate-400 font-mono">
+        <div className="bg-white dark:bg-[#111827] border border-[#E2E8F0] dark:border-[#334155] rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-xs text-[#64748B] dark:text-[#94A3B8] font-mono">
             <span>Peak Bilge Water</span>
-            <Waves className="w-4 h-4 text-teal-400" />
+            <Waves className="w-4 h-4 text-teal-600 dark:text-teal-400" />
           </div>
-          <div className="text-2xl font-black text-teal-300 font-mono mt-2">
+          <div className="text-2xl font-black text-teal-700 dark:text-teal-300 font-mono mt-2">
             {maxWater.toFixed(1)}%
           </div>
-          <span className="text-[10px] text-slate-400 font-mono">
+          <span className="text-[10px] text-[#64748B] dark:text-[#94A3B8] font-mono">
             Dry Baseline: &lt;10%
           </span>
         </div>
 
-        <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-xs text-slate-400 font-mono">
+        <div className="bg-white dark:bg-[#111827] border border-[#E2E8F0] dark:border-[#334155] rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-xs text-[#64748B] dark:text-[#94A3B8] font-mono">
             <span>Highest Risk Score</span>
-            <ShieldAlert className="w-4 h-4 text-rose-400" />
+            <ShieldAlert className="w-4 h-4 text-rose-600 dark:text-rose-400" />
           </div>
-          <div className="text-2xl font-black text-rose-400 font-mono mt-2">
+          <div className="text-2xl font-black text-rose-600 dark:text-rose-400 font-mono mt-2">
             {maxRisk}/100
           </div>
-          <span className="text-[10px] text-slate-400 font-mono">
+          <span className="text-[10px] text-[#64748B] dark:text-[#94A3B8] font-mono">
             Peak Severity Recorded
           </span>
         </div>
       </div>
 
       {/* Main Trend Chart */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-5 shadow-lg">
+      <div className="bg-white dark:bg-[#111827] border border-[#E2E8F0] dark:border-[#334155] rounded-xl p-5 shadow-sm dark:shadow-lg">
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-          <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider font-mono">
+          <h3 className="text-xs font-bold text-[#0F172A] dark:text-slate-200 uppercase tracking-wider font-mono">
             Temporal Trend Analysis ({records.length} data samples)
           </h3>
 
           {/* Metric Selector Buttons */}
-          <div className="flex items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs font-mono">
+          <div className="flex items-center gap-1.5 bg-[#F1F5F9] dark:bg-[#0B1120] p-1 rounded-lg border border-[#E2E8F0] dark:border-[#334155] text-xs font-mono">
             {[
               { id: 'risk', label: 'Risk Score' },
               { id: 'passengers', label: 'Passengers' },
@@ -201,10 +199,10 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ history, config })
               <button
                 key={m.id}
                 onClick={() => setSelectedMetric(m.id as any)}
-                className={`px-3 py-1 rounded text-[11px] font-bold transition ${
+                className={`px-3 py-1 rounded text-[11px] font-bold transition cursor-pointer ${
                   selectedMetric === m.id
                     ? 'bg-cyan-600 text-white shadow'
-                    : 'text-slate-400 hover:text-slate-200'
+                    : 'text-[#64748B] hover:text-[#0F172A] dark:text-[#94A3B8] dark:hover:text-slate-200'
                 }`}
               >
                 {m.label}
@@ -214,29 +212,29 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ history, config })
         </div>
 
         {/* SVG Detailed Graph */}
-        <div className="h-52 w-full bg-slate-950 rounded-xl p-3 border border-slate-800 relative flex flex-col justify-between">
-          <div className="absolute top-2 right-3 text-[10px] font-mono text-slate-500">
+        <div className="h-56 w-full bg-[#F8FAFC] dark:bg-[#0B1120] rounded-xl p-3 border border-[#E2E8F0] dark:border-[#334155] relative flex flex-col justify-between gap-2">
+          <div className="absolute top-2 right-3 text-[10px] font-mono text-[#64748B] dark:text-[#94A3B8]">
             Peak: {maxVal.toFixed(0)} | Baseline: 0
           </div>
 
-          <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} className="w-full h-full overflow-visible">
+          <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} className="w-full flex-1 min-h-0 overflow-visible">
             {/* Horizontal Grid lines */}
-            <line x1="0" y1={chartHeight * 0.25} x2={chartWidth} y2={chartHeight * 0.25} stroke="#1e293b" strokeDasharray="3, 3" />
-            <line x1="0" y1={chartHeight * 0.5} x2={chartWidth} y2={chartHeight * 0.5} stroke="#1e293b" strokeDasharray="3, 3" />
-            <line x1="0" y1={chartHeight * 0.75} x2={chartWidth} y2={chartHeight * 0.75} stroke="#1e293b" strokeDasharray="3, 3" />
+            <line x1="0" y1={chartHeight * 0.25} x2={chartWidth} y2={chartHeight * 0.25} className="stroke-[#E2E8F0] dark:stroke-[#1E293B]" strokeDasharray="3, 3" />
+            <line x1="0" y1={chartHeight * 0.5} x2={chartWidth} y2={chartHeight * 0.5} className="stroke-[#E2E8F0] dark:stroke-[#1E293B]" strokeDasharray="3, 3" />
+            <line x1="0" y1={chartHeight * 0.75} x2={chartWidth} y2={chartHeight * 0.75} className="stroke-[#E2E8F0] dark:stroke-[#1E293B]" strokeDasharray="3, 3" />
 
             {/* Main Path */}
             <path
               d={pathD}
               fill="none"
-              stroke="#06b6d4"
+              stroke="#0891b2"
               strokeWidth="3"
               strokeLinecap="round"
-              className="drop-shadow-md"
+              className="drop-shadow-sm"
             />
           </svg>
 
-          <div className="flex justify-between text-[10px] font-mono text-slate-500 pt-2 border-t border-slate-800">
+          <div className="flex justify-between text-[10px] font-mono text-[#64748B] dark:text-[#94A3B8] pt-2 border-t border-[#E2E8F0] dark:border-[#334155] shrink-0">
             <span>Voyage Start</span>
             <span>Historical Telemetry Window</span>
             <span>Current State</span>

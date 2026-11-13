@@ -138,6 +138,7 @@ let currentTelemetry: SensorTelemetry = {
 };
 
 const telemetryHistory: SensorTelemetry[] = [];
+let alertSeq = 102;
 const alerts: SafetyAlert[] = [
   {
     id: 'ALT-101',
@@ -215,7 +216,7 @@ function evaluateAndStoreTelemetry(telemetry: SensorTelemetry) {
 
   // Generate alert if Warning or higher and not recently triggered
   if (telemetry.riskStatus !== 'SAFE') {
-    const lastAlert = alerts[alerts.length - 1];
+    const lastAlert = alerts[0];
     const isNewHazard = !lastAlert || lastAlert.level !== telemetry.riskStatus || (Date.now() - new Date(lastAlert.timestamp).getTime() > 60000);
     
     if (isNewHazard) {
@@ -225,7 +226,7 @@ function evaluateAndStoreTelemetry(telemetry: SensorTelemetry) {
       else if (riskResult.primaryHazard?.includes('Imbalance')) category = 'IMBALANCE';
 
       const newAlert: SafetyAlert = {
-        id: `ALT-${Date.now().toString().slice(-4)}`,
+        id: `ALT-${alertSeq++}`,
         timestamp: new Date().toISOString(),
         level: telemetry.riskStatus,
         title: `${telemetry.riskStatus}: ${riskResult.primaryHazard || 'Multi-Factor Safety Alert'}`,
