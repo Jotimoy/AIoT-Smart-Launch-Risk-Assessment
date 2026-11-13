@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { VesselConfig, SensorTelemetry } from '../types/iot';
+import { apiFetch } from '../utils/apiClient';
 import { Sliders, Scale, Compass, Waves, Users, CheckCircle2, Terminal } from 'lucide-react';
 
 interface CalibrationViewProps {
@@ -20,9 +21,8 @@ export const CalibrationView: React.FC<CalibrationViewProps> = ({
   const [commandFeedback, setCommandFeedback] = useState<string | null>(null);
 
   const sendCommand = (cmd: string, name: string) => {
-    fetch('/api/device/command', {
+    apiFetch('/api/device/command', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command: cmd })
     })
       .then(r => r.json())

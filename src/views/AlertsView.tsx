@@ -5,9 +5,10 @@ import { AlertOctagon, ShieldCheck, Check, Filter, BellRing, Radio, PhoneCall } 
 interface AlertsViewProps {
   alerts: SafetyAlert[];
   onAcknowledgeAlert: (alertId: string) => void;
+  readOnly?: boolean;
 }
 
-export const AlertsView: React.FC<AlertsViewProps> = ({ alerts, onAcknowledgeAlert }) => {
+export const AlertsView: React.FC<AlertsViewProps> = ({ alerts, onAcknowledgeAlert, readOnly = false }) => {
   const [filterLevel, setFilterLevel] = useState<string>('ALL');
 
   const filteredAlerts = alerts.filter(a => {
@@ -142,7 +143,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ alerts, onAcknowledgeAle
                     <span className="text-[10px] font-mono text-emerald-700 dark:text-emerald-400 flex items-center gap-1 bg-emerald-50 dark:bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-300 dark:border-emerald-500/30">
                       <Check className="w-3 h-3" /> Acknowledged
                     </span>
-                  ) : (
+                  ) : !readOnly ? (
                     <button
                       onClick={() => onAcknowledgeAlert(alert.id)}
                       className="px-3 py-1 rounded bg-white hover:bg-slate-100 text-[#0F172A] border border-[#CBD5E1] dark:bg-[#1F2937] dark:hover:bg-slate-700 dark:text-white dark:border-[#334155] font-mono text-xs font-bold transition flex items-center gap-1 shadow-xs cursor-pointer"
@@ -150,6 +151,10 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ alerts, onAcknowledgeAle
                       <Check className="w-3.5 h-3.5 text-cyan-600 dark:text-cyan-400" />
                       Acknowledge
                     </button>
+                  ) : (
+                    <span className="text-[10px] font-mono text-[#64748B] dark:text-[#94A3B8] px-2 py-0.5 rounded border border-[#E2E8F0] dark:border-[#334155]">
+                      Pending Captain Ack
+                    </span>
                   )}
                 </div>
               </div>

@@ -6,6 +6,7 @@ import { WaterLevelGauge } from '../components/WaterLevelGauge';
 import { LoadCellWidget } from '../components/LoadCellWidget';
 import { VesselMap } from '../components/VesselMap';
 import { buzzerAudio } from '../utils/buzzerAudio';
+import { apiFetch } from '../utils/apiClient';
 import {
   Users,
   AlertOctagon,
@@ -24,6 +25,7 @@ interface DashboardViewProps {
   alerts: SafetyAlert[];
   onOpenSimulator: () => void;
   onNavigateToTab: (tab: any) => void;
+  readOnly?: boolean;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -31,7 +33,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   config,
   alerts,
   onOpenSimulator,
-  onNavigateToTab
+  onNavigateToTab,
+  readOnly = false
 }) => {
   const capacityPercent = telemetry.capacityPercentage;
   const isOvercrowded = telemetry.passengerCount > config.maxPassengerCapacity;
@@ -48,12 +51,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <strong>Simulation Mode:</strong> Displaying simulated sensor readings along the Sadarghat–Chandpur river course.
             </span>
           </div>
-          <button
-            onClick={onOpenSimulator}
-            className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white font-bold font-mono transition shadow cursor-pointer"
-          >
-            Adjust Sensors / Inject Hazards &rarr;
-          </button>
+          {!readOnly && (
+            <button
+              onClick={onOpenSimulator}
+              className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white font-bold font-mono transition shadow cursor-pointer"
+            >
+              Adjust Sensors / Inject Hazards &rarr;
+            </button>
+          )}
         </div>
       ) : (
         <div className="bg-cyan-50 dark:bg-cyan-950/40 border border-cyan-300 dark:border-cyan-600/40 rounded-xl p-3 px-4 flex flex-wrap items-center justify-between gap-3 text-xs text-cyan-900 dark:text-cyan-200 transition-colors duration-200">
@@ -269,7 +274,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             loadImbalancePercent={telemetry.loadImbalancePercent}
             dualHX711Connected={telemetry.dualHX711Connected}
             maxLoadKg={config.maxLoadKg}
-            onTare={() => fetch('/api/device/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ command: 't' }) })}
+            onTare={readOnly ? undefined : () => apiFetch('/api/device/command', { method: 'POST', body: JSON.stringify({ command: 't' }) })}
           />
 
           {/* Active Buzzer Module Card */}

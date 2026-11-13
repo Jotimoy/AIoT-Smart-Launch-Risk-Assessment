@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { apiFetch } from '../utils/apiClient';
 import {
   Cpu,
   Download,
@@ -87,7 +88,8 @@ export const HardwareDocsView: React.FC<HardwareDocsViewProps> = ({ onSendComman
 
   const handleDownloadMysqlSchema = async () => {
     try {
-      const res = await fetch('/api/schema/mysql');
+      const res = await apiFetch('/api/schema/mysql');
+      if (!res.ok) throw new Error('Forbidden');
       const sql = await res.text();
       triggerBlobDownload(sql, 'smart_launch_mysql_schema.sql');
     } catch {
@@ -113,9 +115,8 @@ export const HardwareDocsView: React.FC<HardwareDocsViewProps> = ({ onSendComman
       webSerialBridge.sendCommand(cmd);
     }
 
-    fetch('/api/device/command', {
+    apiFetch('/api/device/command', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command: cmd })
     })
       .then((r) => r.json())

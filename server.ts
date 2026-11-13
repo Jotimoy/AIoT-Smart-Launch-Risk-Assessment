@@ -1,22 +1,98 @@
+import 'dotenv/config';
+import crypto from 'crypto';
 import express, { Request, Response } from 'express';
+import session from 'express-session';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { SensorTelemetry, VesselConfig, SafetyAlert, GPSWaypoint } from './src/types/iot';
 import { calculateSafetyRisk } from './src/utils/riskEngine';
+import {
+  getDatabase,
+  loadSystemConfig,
+  saveSystemConfig,
+  writeAuditLog,
+} from './server/db/database';
+import { SQLiteSessionStore } from './server/auth/sqliteSessionStore';
+import { provisionInitialAdminFromEnv } from './server/auth/adminBootstrap';
+import {
+  createRequireAuth,
+  createRequireRole,
+  getClientIp,
+  requireActiveAccount,
+  requirePasswordChanged,
+  verifyCsrf,
+  type AuthenticatedRequest,
+  DEFAULT_INACTIVITY_TIMEOUT_MS,
+} from './server/auth/middleware';
+import { createAuthRouter } from './server/routes/authRoutes';
+import { createAdminRouter } from './server/routes/adminRoutes';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const db = getDatabase();
 
+app.set('trust proxy', 1);
 app.use(express.json());
 
-// In-memory persistent state (MySQL compatible schema in memory with export & schema generator)
+const SESSION_MAX_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours absolute lifetime
+const sessionSecret =
+  process.env.SESSION_SECRET ||
+  crypto.createHash('sha256').update(`${process.cwd()}:smart-launch-local-session-secret`).digest('hex');
+
+const sessionStore = new SQLiteSessionStore({
+  db,
+  ttlMs: SESSION_MAX_AGE_MS,
+  inactivityTimeoutMs: DEFAULT_INACTIVITY_TIMEOUT_MS,
+});
+
+app.use(
+  session({
+    name: 'smart_launch.sid',
+    secret: sessionSecret,
+    store: sessionStore,
+    resave: false,
+    saveUninitialized: false,
+    rolling: true,
+    proxy: true,
+    cookie: {
+      httpOnly: true,
+      maxAge: SESSION_MAX_AGE_MS,
+      sameSite: 'lax',
+      secure: false,
+    },
+  })
+);
+
+// Adapt cookie flags dynamically for HTTPS proxy environments (AI Studio preview iframe)
+// while keeping SameSite=Lax; secure=false for http://localhost demonstration.
+app.use((req, _res, next) => {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  if (req.session && req.session.cookie) {
+    if (isHttps) {
+      req.session.cookie.secure = true;
+      req.session.cookie.sameSite = 'none';
+    } else {
+      req.session.cookie.secure = false;
+      req.session.cookie.sameSite = 'lax';
+    }
+  }
+  next();
+});
+
+const requireAuth = createRequireAuth(db, DEFAULT_INACTIVITY_TIMEOUT_MS);
+const requireRole = createRequireRole(db);
+
+app.use('/api/auth', createAuthRouter(db, DEFAULT_INACTIVITY_TIMEOUT_MS));
+app.use('/api/admin', createAdminRouter(db, DEFAULT_INACTIVITY_TIMEOUT_MS));
+
+// In-memory telemetry & persisted vessel config in SQLite
 let pendingCommand: string | null = null;
 
-let vesselConfig: VesselConfig = {
+const defaultVesselConfig: VesselConfig = {
   vesselId: 'LAUNCH-BD-8902',
   vesselName: 'MV Sundarban-10',
   registrationNumber: 'M-01-8902',
@@ -47,6 +123,8 @@ let vesselConfig: VesselConfig = {
   gpsUartBaudRate: 9600,
   apiHeartbeatIntervalSec: 2
 };
+
+let vesselConfig: VesselConfig = loadSystemConfig<VesselConfig>(db, 'vessel_config') ?? defaultVesselConfig;
 
 // Seed route: Meghna River path from Sadarghat down towards Chandpur
 const BANGLADESH_RIVER_ROUTE: [number, number][] = [
@@ -397,121 +475,209 @@ app.post('/api/telemetry', (req: Request, res: Response) => {
 });
 
 // Endpoint to queue a command for the ESP32 ('d', 'w', 't', 'm', 'z')
-app.post('/api/device/command', (req: Request, res: Response) => {
-  const { command } = req.body;
-  if (!command || typeof command !== 'string') {
-    return res.status(400).json({ error: 'Missing command character' });
-  }
-  pendingCommand = command.trim().toLowerCase();
-  console.log(`[Command Queued for ESP32]: '${pendingCommand}'`);
-  res.json({ status: 'queued', command: pendingCommand });
-});
-
-// 2. Telemetry polling endpoint
-app.get('/api/telemetry/latest', (req: Request, res: Response) => {
-  // Check if real hardware went stale (> 8 seconds without heartbeat)
-  if (activeMode === 'REAL_HARDWARE') {
-    const elapsed = Date.now() - lastTelemetryReceivedAt;
-    if (elapsed > 8000) {
-      currentTelemetry.hardwareHealth.esp32Wifi = false;
-      currentTelemetry.gps.isStale = true;
+app.post(
+  '/api/device/command',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN'),
+  verifyCsrf,
+  (req: AuthenticatedRequest, res: Response) => {
+    const { command } = req.body;
+    if (!command || typeof command !== 'string') {
+      return res.status(400).json({ error: 'Missing command character' });
     }
+    pendingCommand = command.trim().toLowerCase();
+    console.log(`[Command Queued for ESP32 by ${req.currentUser?.email}]: '${pendingCommand}'`);
+    res.json({ status: 'queued', command: pendingCommand });
   }
-  res.json({
-    telemetry: currentTelemetry,
-    mode: activeMode,
-    lastHeartbeat: new Date(lastTelemetryReceivedAt).toISOString(),
-    config: vesselConfig
-  });
-});
+);
 
-// 3. Telemetry history endpoint
-app.get('/api/telemetry/history', (req: Request, res: Response) => {
-  res.json({
-    history: telemetryHistory,
-    routePoints: gpsRouteLog
-  });
-});
-
-// 4. Server-Sent Events stream for live real-time push to browser
-app.get('/api/events', (req: Request, res: Response) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  // Send initial state immediately
-  res.write(`data: ${JSON.stringify(currentTelemetry)}\n\n`);
-  sseClients.push(res);
-
-  req.on('close', () => {
-    const idx = sseClients.indexOf(res);
-    if (idx !== -1) sseClients.splice(idx, 1);
-  });
-});
-
-// 5. Simulation control: update state or toggle mode
-app.post('/api/simulation/state', (req: Request, res: Response) => {
-  const updates = req.body;
-  if (!updates) return res.status(400).json({ error: 'No data provided' });
-
-  if (updates.mode) {
-    activeMode = updates.mode;
+// 2. Telemetry polling endpoint (ADMIN, CAPTAIN, AUTHORITY)
+app.get(
+  '/api/telemetry/latest',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN', 'AUTHORITY'),
+  (_req: AuthenticatedRequest, res: Response) => {
+    if (activeMode === 'REAL_HARDWARE') {
+      const elapsed = Date.now() - lastTelemetryReceivedAt;
+      if (elapsed > 8000) {
+        currentTelemetry.hardwareHealth.esp32Wifi = false;
+        currentTelemetry.gps.isStale = true;
+      }
+    }
+    res.json({
+      telemetry: currentTelemetry,
+      mode: activeMode,
+      lastHeartbeat: new Date(lastTelemetryReceivedAt).toISOString(),
+      config: vesselConfig
+    });
   }
+);
 
-  const updated: SensorTelemetry = {
-    ...currentTelemetry,
-    ...updates,
-    mode: activeMode,
-    timestamp: new Date().toISOString()
-  };
-
-  // Re-evaluate risk
-  evaluateAndStoreTelemetry(updated);
-
-  res.json({
-    status: 'ok',
-    telemetry: currentTelemetry
-  });
-});
-
-// 6. Config endpoints
-app.get('/api/config', (req: Request, res: Response) => {
-  res.json(vesselConfig);
-});
-
-app.post('/api/config', (req: Request, res: Response) => {
-  const newConfig = req.body;
-  vesselConfig = { ...vesselConfig, ...newConfig };
-  // Re-evaluate current risk with new thresholds
-  evaluateAndStoreTelemetry({ ...currentTelemetry });
-  res.json({ status: 'ok', config: vesselConfig });
-});
-
-// 7. Alert management
-app.get('/api/alerts', (req: Request, res: Response) => {
-  res.json(alerts);
-});
-
-app.post('/api/alerts/acknowledge', (req: Request, res: Response) => {
-  const { alertId } = req.body;
-  const alert = alerts.find(a => a.id === alertId);
-  if (alert) {
-    alert.acknowledged = true;
-    alert.acknowledgedAt = new Date().toISOString();
+// 3. Telemetry history endpoint (ADMIN, CAPTAIN, AUTHORITY)
+app.get(
+  '/api/telemetry/history',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN', 'AUTHORITY'),
+  (_req: AuthenticatedRequest, res: Response) => {
+    res.json({
+      history: telemetryHistory,
+      routePoints: gpsRouteLog
+    });
   }
-  res.json({ status: 'ok', alerts });
-});
+);
 
-// 8. Buzzer Mute Toggle
-app.post('/api/buzzer/mute', (req: Request, res: Response) => {
-  buzzerMuted = !buzzerMuted;
-  currentTelemetry.buzzerMuted = buzzerMuted;
-  res.json({ muted: buzzerMuted });
-});
+// 4. Server-Sent Events stream for live real-time push to browser (ADMIN, CAPTAIN, AUTHORITY)
+app.get(
+  '/api/events',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN', 'AUTHORITY'),
+  (req: AuthenticatedRequest, res: Response) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
 
-// 9. SQL Schema download
-app.get('/api/schema/mysql', (req: Request, res: Response) => {
+    res.write(`data: ${JSON.stringify(currentTelemetry)}\n\n`);
+    sseClients.push(res);
+
+    req.on('close', () => {
+      const idx = sseClients.indexOf(res);
+      if (idx !== -1) sseClients.splice(idx, 1);
+    });
+  }
+);
+
+// 5. Simulation control: update state or toggle mode (ADMIN & CAPTAIN only)
+app.post(
+  '/api/simulation/state',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN'),
+  verifyCsrf,
+  (req: AuthenticatedRequest, res: Response) => {
+    const updates = req.body;
+    if (!updates) return res.status(400).json({ error: 'No data provided' });
+
+    if (updates.mode) {
+      activeMode = updates.mode;
+    }
+
+    const updated: SensorTelemetry = {
+      ...currentTelemetry,
+      ...updates,
+      mode: activeMode,
+      timestamp: new Date().toISOString()
+    };
+
+    evaluateAndStoreTelemetry(updated);
+
+    res.json({
+      status: 'ok',
+      telemetry: currentTelemetry
+    });
+  }
+);
+
+// 6. Config endpoints (Read for all authenticated roles; Write strictly ADMIN only)
+app.get(
+  '/api/config',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN', 'AUTHORITY'),
+  (_req: AuthenticatedRequest, res: Response) => {
+    res.json(vesselConfig);
+  }
+);
+
+app.post(
+  '/api/config',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN'),
+  verifyCsrf,
+  (req: AuthenticatedRequest, res: Response) => {
+    const newConfig = req.body;
+    vesselConfig = { ...vesselConfig, ...newConfig };
+    saveSystemConfig(db, 'vessel_config', vesselConfig);
+    evaluateAndStoreTelemetry({ ...currentTelemetry });
+
+    writeAuditLog(db, {
+      actorUserId: req.currentUser!.id,
+      actorEmail: req.currentUser!.email,
+      actorRole: req.currentUser!.role,
+      eventType: 'CONFIG_UPDATED',
+      details: `Updated vessel thresholds/configuration for ${vesselConfig.vesselName}.`,
+      ipAddress: getClientIp(req),
+    });
+
+    res.json({ status: 'ok', config: vesselConfig });
+  }
+);
+
+// 7. Alert management (Read for all authenticated roles; Acknowledge for ADMIN & CAPTAIN)
+app.get(
+  '/api/alerts',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN', 'AUTHORITY'),
+  (_req: AuthenticatedRequest, res: Response) => {
+    res.json(alerts);
+  }
+);
+
+app.post(
+  '/api/alerts/acknowledge',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN'),
+  verifyCsrf,
+  (req: AuthenticatedRequest, res: Response) => {
+    const { alertId } = req.body;
+    const alert = alerts.find(a => a.id === alertId);
+    if (alert) {
+      alert.acknowledged = true;
+      alert.acknowledgedAt = new Date().toISOString();
+    }
+    res.json({ status: 'ok', alerts });
+  }
+);
+
+// 8. Buzzer Mute Toggle (ADMIN & CAPTAIN)
+app.post(
+  '/api/buzzer/mute',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN', 'CAPTAIN'),
+  verifyCsrf,
+  (_req: AuthenticatedRequest, res: Response) => {
+    buzzerMuted = !buzzerMuted;
+    currentTelemetry.buzzerMuted = buzzerMuted;
+    res.json({ muted: buzzerMuted });
+  }
+);
+
+// 9. SQL Schema download (ADMIN only)
+app.get(
+  '/api/schema/mysql',
+  requireAuth,
+  requireActiveAccount,
+  requirePasswordChanged,
+  requireRole('ADMIN'),
+  (_req: AuthenticatedRequest, res: Response) => {
   const schemaSql = `-- MySQL Database Schema for IoT Smart Launch Overcrowding & Safety System
 -- Project: IoT-Based Smart Launch Overcrowding Detection & Risk Assessment System
 
@@ -617,6 +783,8 @@ app.get('/firmware/smart_launch_esp32.ino', (req: Request, res: Response, next) 
 });
 
 async function startServer() {
+  await provisionInitialAdminFromEnv(db);
+
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (!isProduction) {
@@ -627,13 +795,14 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(__dirname, 'dist', 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Smart Launch IoT Server] Running on http://0.0.0.0:${PORT}`);
+  const host = process.env.HOST || (process.env.K_SERVICE || process.env.APP_URL ? '0.0.0.0' : '127.0.0.1');
+  app.listen(PORT, host, () => {
+    console.log(`[Smart Launch IoT Server] Running on http://localhost:${PORT} (bound ${host})`);
     console.log(`[Mode] Initialized in ${activeMode} mode`);
   });
 }
