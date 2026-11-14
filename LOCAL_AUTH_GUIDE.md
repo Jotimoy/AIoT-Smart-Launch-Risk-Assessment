@@ -31,9 +31,9 @@
    ```bash
    npm run setup:admin -- --generate
    ```
-   Or specify via environment variables:
+   Or specify via environment variables (use single quotes in macOS zsh if your password contains `!`):
    ```bash
-   INITIAL_ADMIN_EMAIL="admin@smartlaunch.local" INITIAL_ADMIN_PASSWORD="YourStrong!Password1" npm run setup:admin
+   INITIAL_ADMIN_EMAIL='admin@smartlaunch.local' INITIAL_ADMIN_PASSWORD='YourStrong!Password1' npm run setup:admin
    ```
 4. **Run automated backend & risk tests**
    ```bash
