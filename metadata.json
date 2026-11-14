@@ -1,0 +1,6 @@
+{
+  "name": "IoT Launch Safety & Overcrowding System",
+  "description": "Real-time IoT monitoring and safety risk assessment system for passenger launches and ferries in Bangladesh, featuring ultrasonic passenger counting, dual load monitoring, MPU6050 tilt sensing, hull water-level detection, u-blox NEO-6M GPS tracking, and active buzzer alerts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

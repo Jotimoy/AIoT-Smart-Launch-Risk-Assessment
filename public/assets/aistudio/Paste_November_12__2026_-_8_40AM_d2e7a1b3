@@ -1,0 +1,1252 @@
+/*
+  AIoT SMART LAUNCH RISK ASSESSMENT
+  ESP32-WROOM-32D
+
+  Hardware:
+    - 2 x HX711 + 1 kg load cell (left and right)
+    - MPU6050 (I2C)
+    - Analog resistive water-level sensor (inside model)
+    - u-blox NEO-6M GPS (UART2)
+    - 2-pin active buzzer driven by NPN transistor
+    - 2 x HC-SR04 (one entry gate, one exit gate)
+
+  Required Arduino libraries:
+    - HX711 by Bogdan Necula (or compatible bogde HX711 library)
+    - TinyGPSPlus by Mikal Hart
+
+  Notes:
+    - HC-SR04 ECHO pins MUST use 5V-to-3.3V voltage dividers.
+    - Buzzer is driven through an NPN transistor, not directly by GPIO.
+    - Water percentage is a relative sensor-coverage estimate, not litres.
+    - One HC-SR04 per gate detects an approach event; it cannot reliably
+      determine direction or guarantee a person fully crossed the gate.
+    - This is a model/prototype monitor, not a certified launch safety system.
+*/
+
+#include <Wire.h>
+#include <math.h>
+#include <Preferences.h>
+#include <TinyGPSPlus.h>
+#include "HX711.h"
+
+// ============================================================
+// PIN CONFIGURATION - ESP32-WROOM-32D
+// ============================================================
+
+// Left load cell / HX711
+#define LEFT_DT_PIN       19
+#define LEFT_SCK_PIN      18
+
+// Right load cell / HX711
+#define RIGHT_DT_PIN      25
+#define RIGHT_SCK_PIN     26
+
+// MPU6050 I2C
+#define MPU_SDA_PIN       21
+#define MPU_SCL_PIN       22
+#define MPU_ADDRESS       0x68  // Use 0x69 if AD0 is HIGH
+
+// Internal water sensor analog output
+#define WATER_ANALOG_PIN  34
+
+// NPN transistor base resistor driven by ESP32
+#define BUZZER_PIN        27
+
+// NEO-6M GPS UART2
+// GPS TX -> ESP32 GPIO16 (RX2)
+// GPS RX <- ESP32 GPIO17 (TX2), optional for read-only use
+#define GPS_RX_PIN        16
+#define GPS_TX_PIN        17
+
+// HC-SR04 entry gate
+#define ENTRY_TRIG_PIN    32
+#define ENTRY_ECHO_PIN    33  // Must be connected through divider
+
+// HC-SR04 exit gate
+#define EXIT_TRIG_PIN     13
+#define EXIT_ECHO_PIN     14  // Must be connected through divider
+
+// ============================================================
+// OBJECTS
+// ============================================================
+
+HX711 leftScale;
+HX711 rightScale;
+
+HardwareSerial gpsSerial(2);
+TinyGPSPlus gps;
+
+Preferences preferences;
+
+// ============================================================
+// CALIBRATION FACTORS - USER'S CALIBRATED VALUES
+// ============================================================
+
+const float LEFT_CALIBRATION_FACTOR  = 695.416;
+const float RIGHT_CALIBRATION_FACTOR = 706.785;
+
+// ============================================================
+// PROTOTYPE THRESHOLDS (TUNE USING MODEL TESTS)
+// These are NOT real-launch safety limits.
+// ============================================================
+
+const float WEIGHT_ZERO_DEADBAND_G = 2.0;
+const float NO_LOAD_THRESHOLD_G = 5.0;
+
+const float IMBALANCE_WARNING_PERCENT = 10.0;
+const float IMBALANCE_CRITICAL_PERCENT = 20.0;
+
+const float TILT_WARNING_DEG = 5.0;
+const float TILT_CRITICAL_DEG = 10.0;
+
+const float LOAD_CELL_WARNING_G = 800.0;
+const float LOAD_CELL_CAPACITY_G = 1000.0;
+
+const float WATER_DETECT_PERCENT = 5.0;
+const float WATER_WARNING_PERCENT = 25.0;
+const float WATER_CRITICAL_PERCENT = 60.0;
+
+const float GATE_DETECT_DISTANCE_CM = 15.0;
+const float GATE_CLEAR_DISTANCE_CM = 20.0;
+
+// ============================================================
+// TIMING SETTINGS
+// ============================================================
+
+const unsigned long OUTPUT_INTERVAL_MS = 1000;
+const unsigned long WATER_READ_INTERVAL_MS = 250;
+const unsigned long GATE_PING_GAP_MS = 70;
+const unsigned long ULTRASONIC_TIMEOUT_US = 18000UL;
+
+// ============================================================
+// WEIGHT VARIABLES
+// ============================================================
+
+float leftWeightG = 0.0;
+float rightWeightG = 0.0;
+
+bool leftScaleValid = false;
+bool rightScaleValid = false;
+
+unsigned long lastLeftScaleReadMs = 0;
+unsigned long lastRightScaleReadMs = 0;
+
+// ============================================================
+// MPU6050 VARIABLES
+// ============================================================
+
+int16_t accelXRaw = 0;
+int16_t accelYRaw = 0;
+int16_t accelZRaw = 0;
+int16_t temperatureRaw = 0;
+int16_t gyroXRaw = 0;
+int16_t gyroYRaw = 0;
+int16_t gyroZRaw = 0;
+
+float pitchDeg = 0.0;
+float rollDeg = 0.0;
+float pitchZeroOffsetDeg = 0.0;
+float rollZeroOffsetDeg = 0.0;
+
+float gyroXRateDps = 0.0;
+float gyroYRateDps = 0.0;
+float gyroXZeroOffsetDps = 0.0;
+float gyroYZeroOffsetDps = 0.0;
+
+bool mpuValid = false;
+unsigned long lastMpuReadMs = 0;
+
+// ============================================================
+// WATER SENSOR VARIABLES
+// ============================================================
+
+int waterRaw = 0;
+int waterDryRaw = -1;
+int waterWetRaw = -1;
+
+bool waterDryReferenceValid = false;
+bool waterCalibrationValid = false;
+
+float waterCoveragePercent = 0.0;
+unsigned long lastWaterReadMs = 0;
+
+// ============================================================
+// GPS VARIABLES
+// ============================================================
+
+bool gpsFixValid = false;
+
+// ============================================================
+// PASSENGER COUNTER VARIABLES
+// ============================================================
+
+struct GateDetector {
+  bool armed;
+  uint8_t nearSamples;
+  uint8_t clearSamples;
+};
+
+GateDetector entryGate = {true, 0, 0};
+GateDetector exitGate  = {true, 0, 0};
+
+float entryDistanceCm = -1.0;
+float exitDistanceCm = -1.0;
+
+uint32_t totalEntries = 0;
+uint32_t totalExits = 0;
+uint32_t passengerCount = 0;
+uint32_t unmatchedExitEvents = 0;
+
+// Ultrasonic pings are alternated to reduce crosstalk.
+enum GatePingStage {
+  PING_ENTRY,
+  PING_EXIT
+};
+
+GatePingStage nextGatePing = PING_ENTRY;
+unsigned long nextGatePingAtMs = 0;
+
+// ============================================================
+// BUZZER VARIABLES
+// ============================================================
+
+const bool BUZZER_ACTIVE_LOW = false;
+const bool ENABLE_BUZZER = true;
+
+const char *buzzerStatus = "OFF";
+
+// ============================================================
+// GENERAL VARIABLES
+// ============================================================
+
+unsigned long lastOutputMs = 0;
+
+// ============================================================
+// PREFERENCES: WATER CALIBRATION AND PASSENGER COUNTS
+// ============================================================
+
+void loadSavedData() {
+  preferences.begin("launch", true);
+
+  waterDryRaw = preferences.getInt("waterDry", -1);
+  waterWetRaw = preferences.getInt("waterWet", -1);
+
+  totalEntries = preferences.getUInt("entries", 0);
+  totalExits = preferences.getUInt("exits", 0);
+  passengerCount = preferences.getUInt("passengers", 0);
+  unmatchedExitEvents = preferences.getUInt("unmatched", 0);
+
+  preferences.end();
+
+  waterDryReferenceValid = (waterDryRaw >= 0);
+  waterCalibrationValid =
+      (waterDryRaw >= 0) &&
+      (waterWetRaw >= 0) &&
+      (abs(waterWetRaw - waterDryRaw) >= 50);
+}
+
+void saveWaterDryReference() {
+  preferences.begin("launch", false);
+  preferences.putInt("waterDry", waterDryRaw);
+  preferences.remove("waterWet");
+  preferences.end();
+}
+
+void saveWaterCalibration() {
+  preferences.begin("launch", false);
+  preferences.putInt("waterDry", waterDryRaw);
+  preferences.putInt("waterWet", waterWetRaw);
+  preferences.end();
+}
+
+void savePassengerCounts() {
+  preferences.begin("launch", false);
+  preferences.putUInt("entries", totalEntries);
+  preferences.putUInt("exits", totalExits);
+  preferences.putUInt("passengers", passengerCount);
+  preferences.putUInt("unmatched", unmatchedExitEvents);
+  preferences.end();
+}
+
+// ============================================================
+// BUZZER CONTROL
+// GPIO27 drives an NPN transistor through a 1k resistor.
+// ============================================================
+
+void setBuzzer(bool enabled) {
+  if (!ENABLE_BUZZER) return;
+
+  if (BUZZER_ACTIVE_LOW) {
+    digitalWrite(BUZZER_PIN, enabled ? LOW : HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, enabled ? HIGH : LOW);
+  }
+}
+
+void updateBuzzer(bool criticalAlert,
+                  bool warningAlert,
+                  bool waterDetected) {
+  const unsigned long now = millis();
+  bool buzzerOn = false;
+
+  if (criticalAlert) {
+    // Continuous tone for a critical prototype alert.
+    buzzerOn = true;
+    buzzerStatus = "CRITICAL - CONTINUOUS";
+  }
+  else if (warningAlert) {
+    // Two short beeps each second.
+    const unsigned long phase = now % 1000UL;
+    buzzerOn = (phase < 150UL) ||
+               (phase >= 300UL && phase < 450UL);
+    buzzerStatus = "WARNING - DOUBLE BEEP";
+  }
+  else if (waterDetected) {
+    // One short beep every 2.5 seconds.
+    const unsigned long phase = now % 2500UL;
+    buzzerOn = (phase < 120UL);
+    buzzerStatus = "WATER DETECTED - BEEP";
+  }
+  else {
+    buzzerOn = false;
+    buzzerStatus = "OFF";
+  }
+
+  setBuzzer(buzzerOn);
+}
+
+// ============================================================
+// WATER SENSOR
+// The displayed percentage is relative wetted-track coverage,
+// NOT litres or the percentage of the hull filled with water.
+// ============================================================
+
+int readWaterRawAverage() {
+  long total = 0;
+  const uint8_t samples = 16;
+
+  for (uint8_t i = 0; i < samples; i++) {
+    total += analogRead(WATER_ANALOG_PIN);
+    delayMicroseconds(300);
+  }
+
+  return (int)(total / samples);
+}
+
+void calibrateWaterDry() {
+  Serial.println();
+  Serial.println("Water dry calibration: keep sensor fully dry.");
+
+  waterRaw = readWaterRawAverage();
+  waterDryRaw = waterRaw;
+  waterDryReferenceValid = true;
+  waterCalibrationValid = false;
+  waterCoveragePercent = 0.0;
+
+  saveWaterDryReference();
+
+  Serial.print("Saved DRY ADC value: ");
+  Serial.println(waterDryRaw);
+  Serial.println("Now wet the sensing tracks and send 'w'.");
+}
+
+void calibrateWaterWet() {
+  if (!waterDryReferenceValid) {
+    Serial.println("Water calibration error: send 'd' first while dry.");
+    return;
+  }
+
+  Serial.println();
+  Serial.println("Wet only the sensing tracks; keep connector/electronics dry.");
+
+  waterRaw = readWaterRawAverage();
+  waterWetRaw = waterRaw;
+
+  Serial.print("DRY ADC: ");
+  Serial.println(waterDryRaw);
+  Serial.print("WET ADC: ");
+  Serial.println(waterWetRaw);
+
+  if (abs(waterWetRaw - waterDryRaw) < 50) {
+    waterCalibrationValid = false;
+    Serial.println("Water calibration FAILED: dry/wet difference is too small.");
+    Serial.println("Check wiring, supply, and that the sensing tracks are wet.");
+    return;
+  }
+
+  waterCalibrationValid = true;
+  saveWaterCalibration();
+
+  Serial.println("Water calibration successful and saved in ESP32 flash.");
+}
+
+void updateWaterSensor() {
+  const unsigned long now = millis();
+  if (now - lastWaterReadMs < WATER_READ_INTERVAL_MS) return;
+
+  lastWaterReadMs = now;
+  waterRaw = readWaterRawAverage();
+
+  if (!waterCalibrationValid) {
+    waterCoveragePercent = 0.0;
+    return;
+  }
+
+  // Signed denominator supports either ADC direction (wet may be
+  // higher or lower than dry depending on the board and water).
+  const float denominator = (float)(waterWetRaw - waterDryRaw);
+  if (fabs(denominator) < 1.0) {
+    waterCalibrationValid = false;
+    waterCoveragePercent = 0.0;
+    return;
+  }
+
+  waterCoveragePercent =
+      ((float)(waterRaw - waterDryRaw) / denominator) * 100.0;
+
+  if (waterCoveragePercent < 0.0) waterCoveragePercent = 0.0;
+  if (waterCoveragePercent > 100.0) waterCoveragePercent = 100.0;
+}
+
+// ============================================================
+// MPU6050
+// Direct register method matching the user's working test code.
+// ============================================================
+
+void writeMPURegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDRESS);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission(true);
+}
+
+bool initializeMPU() {
+  Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
+
+  Wire.beginTransmission(MPU_ADDRESS);
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+
+  // Wake up MPU6050.
+  writeMPURegister(0x6B, 0x00);
+  delay(100);
+
+  // Accelerometer +/-2g.
+  writeMPURegister(0x1C, 0x00);
+
+  // Gyroscope +/-250 degrees/second.
+  writeMPURegister(0x1B, 0x00);
+
+  // Digital low-pass filter.
+  writeMPURegister(0x1A, 0x03);
+  delay(100);
+
+  return true;
+}
+
+bool readMPU6050(float &currentPitch,
+                 float &currentRoll,
+                 float &currentGyroX,
+                 float &currentGyroY) {
+  Wire.beginTransmission(MPU_ADDRESS);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  const uint8_t received = Wire.requestFrom(
+      (uint8_t)MPU_ADDRESS,
+      (uint8_t)14,
+      (uint8_t)true
+  );
+
+  if (received != 14) {
+    while (Wire.available()) Wire.read();
+    return false;
+  }
+
+  accelXRaw = (int16_t)((Wire.read() << 8) | Wire.read());
+  accelYRaw = (int16_t)((Wire.read() << 8) | Wire.read());
+  accelZRaw = (int16_t)((Wire.read() << 8) | Wire.read());
+  temperatureRaw = (int16_t)((Wire.read() << 8) | Wire.read());
+  gyroXRaw = (int16_t)((Wire.read() << 8) | Wire.read());
+  gyroYRaw = (int16_t)((Wire.read() << 8) | Wire.read());
+  gyroZRaw = (int16_t)((Wire.read() << 8) | Wire.read());
+
+  const float ax = accelXRaw / 16384.0f;
+  const float ay = accelYRaw / 16384.0f;
+  const float az = accelZRaw / 16384.0f;
+
+  currentPitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
+  currentRoll = atan2f(ay, az) * 180.0f / PI;
+
+  // At +/-250 deg/s, sensitivity is 131 LSB/(deg/s).
+  currentGyroX = gyroXRaw / 131.0f;
+  currentGyroY = gyroYRaw / 131.0f;
+
+  return true;
+}
+
+float normalizeAngle(float angle) {
+  while (angle > 180.0f) angle -= 360.0f;
+  while (angle < -180.0f) angle += 360.0f;
+  return angle;
+}
+
+bool calibrateMPULevel() {
+  Serial.println();
+  Serial.println("MPU calibration: keep the model level and completely still.");
+
+  float pitchSum = 0.0f;
+  float rollSum = 0.0f;
+  float gyroXSum = 0.0f;
+  float gyroYSum = 0.0f;
+  uint16_t validSamples = 0;
+
+  for (uint16_t i = 0; i < 100; i++) {
+    float p, r, gx, gy;
+    if (readMPU6050(p, r, gx, gy)) {
+      pitchSum += p;
+      rollSum += r;
+      gyroXSum += gx;
+      gyroYSum += gy;
+      validSamples++;
+    }
+    delay(10);
+  }
+
+  if (validSamples < 80) {
+    Serial.println("MPU calibration FAILED: too few valid samples.");
+    return false;
+  }
+
+  pitchZeroOffsetDeg = pitchSum / validSamples;
+  rollZeroOffsetDeg = rollSum / validSamples;
+  gyroXZeroOffsetDps = gyroXSum / validSamples;
+  gyroYZeroOffsetDps = gyroYSum / validSamples;
+
+  pitchDeg = 0.0f;
+  rollDeg = 0.0f;
+  gyroXRateDps = 0.0f;
+  gyroYRateDps = 0.0f;
+
+  Serial.println("MPU level and gyro bias calibration complete.");
+  Serial.print("Pitch zero offset: ");
+  Serial.println(pitchZeroOffsetDeg, 2);
+  Serial.print("Roll zero offset: ");
+  Serial.println(rollZeroOffsetDeg, 2);
+  Serial.print("Gyro X bias: ");
+  Serial.println(gyroXZeroOffsetDps, 2);
+  Serial.print("Gyro Y bias: ");
+  Serial.println(gyroYZeroOffsetDps, 2);
+
+  return true;
+}
+
+void updateMPU() {
+  float rawPitch, rawRoll, rawGyroX, rawGyroY;
+
+  mpuValid = readMPU6050(rawPitch, rawRoll, rawGyroX, rawGyroY);
+
+  if (mpuValid) {
+    pitchDeg = normalizeAngle(rawPitch - pitchZeroOffsetDeg);
+    rollDeg = normalizeAngle(rawRoll - rollZeroOffsetDeg);
+    gyroXRateDps = rawGyroX - gyroXZeroOffsetDps;
+    gyroYRateDps = rawGyroY - gyroYZeroOffsetDps;
+    lastMpuReadMs = millis();
+  }
+  else if (millis() - lastMpuReadMs > 1000UL) {
+    mpuValid = false;
+  }
+}
+
+// ============================================================
+// GPS NEO-6M
+// ============================================================
+
+void updateGPS() {
+  // Keep parsing continuously so the UART receive buffer does not fill.
+  while (gpsSerial.available() > 0) {
+    gps.encode((char)gpsSerial.read());
+  }
+
+  gpsFixValid = gps.location.isValid() && (gps.location.age() < 5000UL);
+}
+
+// ============================================================
+// HC-SR04 ULTRASONIC DISTANCE
+// ============================================================
+
+float readUltrasonicDistanceCm(uint8_t trigPin, uint8_t echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(3);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  const unsigned long duration = pulseIn(
+      echoPin,
+      HIGH,
+      ULTRASONIC_TIMEOUT_US
+  );
+
+  if (duration == 0) {
+    return -1.0f; // No echo / no object in measurable range.
+  }
+
+  return duration / 58.0f;
+}
+
+void recordEntryEvent() {
+  totalEntries++;
+  passengerCount++;
+  savePassengerCounts();
+
+  Serial.println();
+  Serial.println("*** ENTRY DETECTED: PASSENGER +1 ***");
+  Serial.print("Total entries: ");
+  Serial.println(totalEntries);
+  Serial.print("Passengers currently onboard: ");
+  Serial.println(passengerCount);
+}
+
+void recordExitEvent() {
+  totalExits++;
+
+  if (passengerCount > 0) {
+    passengerCount--;
+  } else {
+    // Exit event was detected while stored onboard count was zero.
+    // This avoids unsigned underflow and keeps the count at zero.
+    unmatchedExitEvents++;
+  }
+
+  savePassengerCounts();
+
+  Serial.println();
+  Serial.println("*** EXIT DETECTED: PASSENGER -1 (IF COUNT > 0) ***");
+  Serial.print("Total exits: ");
+  Serial.println(totalExits);
+  Serial.print("Passengers currently onboard: ");
+  Serial.println(passengerCount);
+}
+
+void processGateDetector(GateDetector &gate,
+                         float distanceCm,
+                         bool isEntryGate) {
+  if (gate.armed) {
+    // Require two consecutive near readings to reduce false triggers.
+    if (distanceCm >= 2.0f && distanceCm <= GATE_DETECT_DISTANCE_CM) {
+      if (gate.nearSamples < 255) gate.nearSamples++;
+    } else {
+      gate.nearSamples = 0;
+    }
+
+    if (gate.nearSamples >= 2) {
+      gate.armed = false;
+      gate.nearSamples = 0;
+      gate.clearSamples = 0;
+
+      if (isEntryGate) {
+        recordEntryEvent();
+      } else {
+        recordExitEvent();
+      }
+    }
+  }
+  else {
+    // Re-arm only after the target has moved away.
+    if (distanceCm < 0.0f || distanceCm >= GATE_CLEAR_DISTANCE_CM) {
+      if (gate.clearSamples < 255) gate.clearSamples++;
+    } else {
+      gate.clearSamples = 0;
+    }
+
+    if (gate.clearSamples >= 3) {
+      gate.armed = true;
+      gate.clearSamples = 0;
+      gate.nearSamples = 0;
+    }
+  }
+}
+
+void updatePassengerGates() {
+  const unsigned long now = millis();
+  if ((int32_t)(now - nextGatePingAtMs) < 0) return;
+
+  if (nextGatePing == PING_ENTRY) {
+    entryDistanceCm = readUltrasonicDistanceCm(
+        ENTRY_TRIG_PIN,
+        ENTRY_ECHO_PIN
+    );
+
+    processGateDetector(entryGate, entryDistanceCm, true);
+    nextGatePing = PING_EXIT;
+  }
+  else {
+    exitDistanceCm = readUltrasonicDistanceCm(
+        EXIT_TRIG_PIN,
+        EXIT_ECHO_PIN
+    );
+
+    processGateDetector(exitGate, exitDistanceCm, false);
+    nextGatePing = PING_ENTRY;
+  }
+
+  // Leave a minimum quiet gap between the two ultrasonic pings.
+  nextGatePingAtMs = millis() + GATE_PING_GAP_MS;
+}
+
+// ============================================================
+// SERIAL COMMANDS
+// d = dry water calibration
+// w = wet water calibration
+// t = tare both load cells
+// m = recalibrate MPU level (model must be level and still)
+// z = reset passenger counters
+// ============================================================
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    const char command = (char)Serial.read();
+
+    if (command == '\n' || command == '\r') continue;
+
+    if (command == 'd' || command == 'D') {
+      setBuzzer(false);
+      calibrateWaterDry();
+    }
+    else if (command == 'w' || command == 'W') {
+      setBuzzer(false);
+      calibrateWaterWet();
+    }
+    else if (command == 't' || command == 'T') {
+      Serial.println("Taring both load cells. Remove all weight first.");
+
+      if (leftScale.wait_ready_timeout(3000) &&
+          rightScale.wait_ready_timeout(3000)) {
+        leftScale.tare(20);
+        rightScale.tare(20);
+        leftWeightG = 0.0f;
+        rightWeightG = 0.0f;
+        lastLeftScaleReadMs = millis();
+        lastRightScaleReadMs = millis();
+        Serial.println("Both load cells tared.");
+      } else {
+        Serial.println("Tare failed: check HX711 connections.");
+      }
+    }
+    else if (command == 'm' || command == 'M') {
+      setBuzzer(false);
+      calibrateMPULevel();
+    }
+    else if (command == 'z' || command == 'Z') {
+      totalEntries = 0;
+      totalExits = 0;
+      passengerCount = 0;
+      unmatchedExitEvents = 0;
+
+      entryGate.armed = true;
+      entryGate.nearSamples = 0;
+      entryGate.clearSamples = 0;
+      exitGate.armed = true;
+      exitGate.nearSamples = 0;
+      exitGate.clearSamples = 0;
+
+      savePassengerCounts();
+      Serial.println("Passenger counters reset to zero and saved.");
+    }
+  }
+}
+
+// ============================================================
+// SERIAL MONITOR OUTPUT
+// ============================================================
+
+void printMonitoringData() {
+  const unsigned long now = millis();
+  if (now - lastOutputMs < OUTPUT_INTERVAL_MS) return;
+  lastOutputMs = now;
+
+  const float totalWeightG = leftWeightG + rightWeightG;
+  const float weightDifferenceG = fabs(leftWeightG - rightWeightG);
+
+  float leftLoadPercent = 0.0f;
+  float rightLoadPercent = 0.0f;
+  float imbalancePercent = 0.0f;
+
+  const bool validDistribution =
+      leftScaleValid && rightScaleValid &&
+      leftWeightG >= 0.0f && rightWeightG >= 0.0f &&
+      totalWeightG >= NO_LOAD_THRESHOLD_G;
+
+  if (validDistribution) {
+    leftLoadPercent = (leftWeightG / totalWeightG) * 100.0f;
+    rightLoadPercent = (rightWeightG / totalWeightG) * 100.0f;
+    imbalancePercent = (weightDifferenceG / totalWeightG) * 100.0f;
+  }
+
+  const char *balanceStatus;
+  if (!leftScaleValid || !rightScaleValid) {
+    balanceStatus = "SENSOR ERROR";
+  }
+  else if (leftWeightG < 0.0f || rightWeightG < 0.0f) {
+    balanceStatus = "CHECK LOAD CELL";
+  }
+  else if (totalWeightG < NO_LOAD_THRESHOLD_G) {
+    balanceStatus = "NO LOAD";
+  }
+  else if (imbalancePercent >= IMBALANCE_CRITICAL_PERCENT) {
+    balanceStatus = "HIGH IMBALANCE";
+  }
+  else if (imbalancePercent >= IMBALANCE_WARNING_PERCENT) {
+    balanceStatus = "IMBALANCE WARNING";
+  }
+  else {
+    balanceStatus = "BALANCED";
+  }
+
+  const float absRoll = fabs(rollDeg);
+  const float absPitch = fabs(pitchDeg);
+
+  const char *tiltStatus;
+  if (!mpuValid) {
+    tiltStatus = "IMU ERROR";
+  }
+  else if (absRoll >= TILT_CRITICAL_DEG || absPitch >= TILT_CRITICAL_DEG) {
+    tiltStatus = "HIGH TILT";
+  }
+  else if (absRoll >= TILT_WARNING_DEG || absPitch >= TILT_WARNING_DEG) {
+    tiltStatus = "TILT WARNING";
+  }
+  else {
+    tiltStatus = "NORMAL";
+  }
+
+  const char *waterStatus;
+  if (!waterCalibrationValid) {
+    waterStatus = "NOT CALIBRATED";
+  }
+  else if (waterCoveragePercent < WATER_DETECT_PERCENT) {
+    waterStatus = "DRY";
+  }
+  else if (waterCoveragePercent < WATER_WARNING_PERCENT) {
+    waterStatus = "WATER DETECTED";
+  }
+  else if (waterCoveragePercent < WATER_CRITICAL_PERCENT) {
+    waterStatus = "WATER WARNING";
+  }
+  else {
+    waterStatus = "HIGH WATER";
+  }
+
+  const bool capacityReached = leftScaleValid && rightScaleValid &&
+      (leftWeightG >= LOAD_CELL_CAPACITY_G ||
+       rightWeightG >= LOAD_CELL_CAPACITY_G);
+
+  const bool nearCapacity = leftScaleValid && rightScaleValid &&
+      (leftWeightG >= LOAD_CELL_WARNING_G ||
+       rightWeightG >= LOAD_CELL_WARNING_G);
+
+  const bool detectedWater = waterCalibrationValid &&
+      (waterCoveragePercent >= WATER_DETECT_PERCENT);
+
+  const bool warningWater = waterCalibrationValid &&
+      (waterCoveragePercent >= WATER_WARNING_PERCENT);
+
+  const bool criticalWater = waterCalibrationValid &&
+      (waterCoveragePercent >= WATER_CRITICAL_PERCENT);
+
+  const bool warningTilt = mpuValid &&
+      (absRoll >= TILT_WARNING_DEG || absPitch >= TILT_WARNING_DEG);
+
+  const bool criticalTilt = mpuValid &&
+      (absRoll >= TILT_CRITICAL_DEG || absPitch >= TILT_CRITICAL_DEG);
+
+  const bool warningImbalance = validDistribution &&
+      (imbalancePercent >= IMBALANCE_WARNING_PERCENT);
+
+  const bool criticalImbalance = validDistribution &&
+      (imbalancePercent >= IMBALANCE_CRITICAL_PERCENT);
+
+  const bool criticalAlert = criticalWater || criticalTilt ||
+      criticalImbalance || capacityReached;
+
+  const bool warningAlert = warningWater || warningTilt ||
+      warningImbalance || nearCapacity;
+
+  // Buzzer is updated in loop() independently; this output reports its mode.
+  const char *capacityStatus;
+  if (!leftScaleValid || !rightScaleValid) {
+    capacityStatus = "SENSOR ERROR";
+  }
+  else if (capacityReached) {
+    capacityStatus = "CAPACITY REACHED";
+  }
+  else if (nearCapacity) {
+    capacityStatus = "NEAR CAPACITY";
+  }
+  else {
+    capacityStatus = "WITHIN NOMINAL CAPACITY";
+  }
+
+  const char *overallStatus;
+  if (!leftScaleValid || !rightScaleValid || !mpuValid) {
+    overallStatus = "SENSOR DATA ERROR";
+  }
+  else if (leftWeightG < 0.0f || rightWeightG < 0.0f) {
+    overallStatus = "CHECK WEIGHT SENSORS";
+  }
+  else if (capacityReached) {
+    overallStatus = "LOAD CELL LIMIT";
+  }
+  else if (!waterCalibrationValid) {
+    overallStatus = "WATER CALIBRATION NEEDED";
+  }
+  else if (criticalAlert) {
+    overallStatus = "HIGH ALERT - PROTOTYPE";
+  }
+  else if (warningAlert || detectedWater) {
+    overallStatus = "WARNING - PROTOTYPE";
+  }
+  else {
+    overallStatus = "NORMAL - PROTOTYPE";
+  }
+
+  Serial.println();
+  Serial.println("================================================");
+  Serial.println("       AIoT SMART LAUNCH RISK ASSESSMENT");
+  Serial.println("================================================");
+
+  // Weight monitoring
+  Serial.println("[WEIGHT MONITORING]");
+  Serial.print("Left Weight       : "); Serial.print(leftWeightG, 2); Serial.println(" g");
+  Serial.print("Right Weight      : "); Serial.print(rightWeightG, 2); Serial.println(" g");
+  Serial.print("Total Weight      : "); Serial.print(totalWeightG, 2); Serial.println(" g");
+  Serial.print("Weight Difference : "); Serial.print(weightDifferenceG, 2); Serial.println(" g");
+
+  if (validDistribution) {
+    Serial.print("Left Load Share   : "); Serial.print(leftLoadPercent, 1); Serial.println(" %");
+    Serial.print("Right Load Share  : "); Serial.print(rightLoadPercent, 1); Serial.println(" %");
+    Serial.print("Imbalance         : "); Serial.print(imbalancePercent, 1); Serial.println(" %");
+  } else {
+    Serial.println("Load Distribution: Not available / no load");
+  }
+  Serial.print("Balance Status    : "); Serial.println(balanceStatus);
+
+  // MPU monitoring
+  Serial.println("------------------------------------------------");
+  Serial.println("[MPU6050 TILT MONITORING]");
+  if (mpuValid) {
+    Serial.print("Pitch             : "); Serial.print(pitchDeg, 2); Serial.println(" deg");
+    Serial.print("Roll              : "); Serial.print(rollDeg, 2); Serial.println(" deg");
+    Serial.print("Gyro X Rate       : "); Serial.print(gyroXRateDps, 2); Serial.println(" deg/s");
+    Serial.print("Gyro Y Rate       : "); Serial.print(gyroYRateDps, 2); Serial.println(" deg/s");
+  } else {
+    Serial.println("MPU6050: NO VALID DATA");
+  }
+  Serial.print("Tilt Status       : "); Serial.println(tiltStatus);
+
+  // Water monitoring
+  Serial.println("------------------------------------------------");
+  Serial.println("[INTERNAL WATER MONITORING]");
+  Serial.print("Water ADC         : "); Serial.println(waterRaw);
+  if (waterCalibrationValid) {
+    Serial.print("Track Coverage    : "); Serial.print(waterCoveragePercent, 1); Serial.println(" % (approx.)");
+  } else {
+    Serial.println("Track Coverage    : Calibration required");
+  }
+  Serial.print("Water Status      : "); Serial.println(waterStatus);
+
+  // GPS monitoring
+  Serial.println("------------------------------------------------");
+  Serial.println("[GPS LOCATION MONITORING]");
+  if (gpsFixValid) {
+    Serial.println("GPS Status        : FIXED");
+    Serial.print("Latitude          : "); Serial.println(gps.location.lat(), 6);
+    Serial.print("Longitude         : "); Serial.println(gps.location.lng(), 6);
+
+    Serial.print("Speed             : ");
+    if (gps.speed.isValid()) {
+      Serial.print(gps.speed.kmph(), 2); Serial.println(" km/h");
+    } else {
+      Serial.println("N/A");
+    }
+
+    Serial.print("Altitude          : ");
+    if (gps.altitude.isValid()) {
+      Serial.print(gps.altitude.meters(), 2); Serial.println(" m");
+    } else {
+      Serial.println("N/A");
+    }
+
+    Serial.print("Satellites        : ");
+    if (gps.satellites.isValid()) Serial.println(gps.satellites.value());
+    else Serial.println("N/A");
+
+    Serial.print("Google Maps       : https://maps.google.com/?q=");
+    Serial.print(gps.location.lat(), 6);
+    Serial.print(",");
+    Serial.println(gps.location.lng(), 6);
+  } else {
+    Serial.println("GPS Status        : WAITING FOR FIX");
+    if (gps.satellites.isValid()) {
+      Serial.print("Satellites        : "); Serial.println(gps.satellites.value());
+    }
+    Serial.print("GPS Characters    : "); Serial.println(gps.charsProcessed());
+  }
+
+  // Passenger counting
+  Serial.println("------------------------------------------------");
+  Serial.println("[PASSENGER MONITORING]");
+  Serial.print("Entry Distance    : ");
+  if (entryDistanceCm >= 0.0f) { Serial.print(entryDistanceCm, 1); Serial.println(" cm"); }
+  else { Serial.println("No echo / clear"); }
+
+  Serial.print("Exit Distance     : ");
+  if (exitDistanceCm >= 0.0f) { Serial.print(exitDistanceCm, 1); Serial.println(" cm"); }
+  else { Serial.println("No echo / clear"); }
+
+  Serial.print("Total Entries     : "); Serial.println(totalEntries);
+  Serial.print("Total Exits       : "); Serial.println(totalExits);
+  Serial.print("Passengers Aboard : "); Serial.println(passengerCount);
+  Serial.print("Unmatched Exits   : "); Serial.println(unmatchedExitEvents);
+
+  // Buzzer and overall status
+  Serial.println("------------------------------------------------");
+  Serial.println("[ALERT MONITORING]");
+  Serial.print("Capacity Status   : "); Serial.println(capacityStatus);
+  Serial.print("Buzzer Status     : "); Serial.println(buzzerStatus);
+  Serial.print("OVERALL STATUS    : "); Serial.println(overallStatus);
+  Serial.println("================================================");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("================================================");
+  Serial.println(" AIoT SMART LAUNCH RISK ASSESSMENT - STARTING");
+  Serial.println("================================================");
+
+  // Buzzer output must be LOW at startup.
+  pinMode(BUZZER_PIN, OUTPUT);
+  setBuzzer(false);
+
+  // Water ADC setup.
+  analogReadResolution(12);
+  analogSetPinAttenuation(WATER_ANALOG_PIN, ADC_11db);
+
+  // HC-SR04 pin setup.
+  pinMode(ENTRY_TRIG_PIN, OUTPUT);
+  pinMode(ENTRY_ECHO_PIN, INPUT);
+  pinMode(EXIT_TRIG_PIN, OUTPUT);
+  pinMode(EXIT_ECHO_PIN, INPUT);
+  digitalWrite(ENTRY_TRIG_PIN, LOW);
+  digitalWrite(EXIT_TRIG_PIN, LOW);
+
+  // Load saved water calibration and passenger counters.
+  loadSavedData();
+
+  Serial.println("Saved passenger data loaded.");
+  Serial.print("Passengers at startup: ");
+  Serial.println(passengerCount);
+
+  // GPS UART2. GPS TX must connect to ESP32 RX GPIO16.
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("GPS UART2 initialized at 9600 baud.");
+
+  // MPU6050 setup.
+  Serial.println("Initializing MPU6050...");
+  if (!initializeMPU()) {
+    Serial.println("FATAL ERROR: MPU6050 not detected at address 0x68.");
+    Serial.println("Check SDA=21, SCL=22, 3.3V, GND, and AD0.");
+    while (true) {
+      setBuzzer(false);
+      delay(1000);
+    }
+  }
+  Serial.println("MPU6050 connected.");
+
+  // HX711 setup.
+  leftScale.begin(LEFT_DT_PIN, LEFT_SCK_PIN);
+  rightScale.begin(RIGHT_DT_PIN, RIGHT_SCK_PIN);
+
+  Serial.println("Connecting left HX711...");
+  if (!leftScale.wait_ready_timeout(4000)) {
+    Serial.println("FATAL ERROR: Left HX711 not ready. Check wiring.");
+    while (true) {
+      setBuzzer(false);
+      delay(1000);
+    }
+  }
+
+  Serial.println("Connecting right HX711...");
+  if (!rightScale.wait_ready_timeout(4000)) {
+    Serial.println("FATAL ERROR: Right HX711 not ready. Check wiring.");
+    while (true) {
+      setBuzzer(false);
+      delay(1000);
+    }
+  }
+
+  leftScale.set_scale(LEFT_CALIBRATION_FACTOR);
+  rightScale.set_scale(RIGHT_CALIBRATION_FACTOR);
+
+  // Calibrate MPU with model level and still.
+  if (!calibrateMPULevel()) {
+    Serial.println("FATAL ERROR: MPU6050 calibration failed.");
+    while (true) {
+      setBuzzer(false);
+      delay(1000);
+    }
+  }
+
+  // Tare load cells. Model should have no payload during startup.
+  Serial.println("Remove all payload from both load cells.");
+  Serial.println("Taring load cells in 2 seconds...");
+  delay(2000);
+
+  leftScale.tare(20);
+  rightScale.tare(20);
+
+  leftWeightG = 0.0f;
+  rightWeightG = 0.0f;
+  lastLeftScaleReadMs = millis();
+  lastRightScaleReadMs = millis();
+  leftScaleValid = true;
+  rightScaleValid = true;
+
+  // Initial water ADC sample.
+  waterRaw = readWaterRawAverage();
+  lastWaterReadMs = millis();
+
+  // Initialize alternating ultrasonic schedule.
+  nextGatePing = PING_ENTRY;
+  nextGatePingAtMs = millis() + 500;
+
+  Serial.println();
+  Serial.println("ALL MAIN SENSORS INITIALIZED.");
+
+  if (waterCalibrationValid) {
+    Serial.println("Water calibration: LOADED FROM FLASH.");
+  } else {
+    Serial.println("Water calibration required: keep sensor dry and send 'd'.");
+  }
+
+  Serial.println();
+  Serial.println("SERIAL COMMANDS:");
+  Serial.println("d = water sensor DRY calibration");
+  Serial.println("w = water sensor WET calibration");
+  Serial.println("t = tare both load cells (remove load first)");
+  Serial.println("m = recalibrate MPU (model level and still)");
+  Serial.println("z = reset entry, exit, and onboard passenger counts");
+  Serial.println();
+  Serial.println("GPS may need open sky and time to obtain a fix.");
+  Serial.println("================================================");
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+  // 1. Read incoming GPS characters continuously.
+  updateGPS();
+
+  // 2. Handle serial commands.
+  handleSerialCommands();
+
+  // 3. Read load cells when HX711 data is ready.
+  if (leftScale.is_ready()) {
+    leftWeightG = leftScale.get_units(1);
+    lastLeftScaleReadMs = millis();
+  }
+
+  if (rightScale.is_ready()) {
+    rightWeightG = rightScale.get_units(1);
+    lastRightScaleReadMs = millis();
+  }
+
+  leftScaleValid = (millis() - lastLeftScaleReadMs < 1500UL);
+  rightScaleValid = (millis() - lastRightScaleReadMs < 1500UL);
+
+  if (fabs(leftWeightG) < WEIGHT_ZERO_DEADBAND_G) leftWeightG = 0.0f;
+  if (fabs(rightWeightG) < WEIGHT_ZERO_DEADBAND_G) rightWeightG = 0.0f;
+
+  // 4. Read MPU6050.
+  updateMPU();
+
+  // 5. Read internal water sensor at its scheduled interval.
+  updateWaterSensor();
+
+  // 6. Read entry/exit HC-SR04 sensors in alternating slots.
+  updatePassengerGates();
+
+  // 7. Calculate alert conditions for buzzer.
+  const float totalWeightG = leftWeightG + rightWeightG;
+  const float differenceG = fabs(leftWeightG - rightWeightG);
+
+  const bool validDistribution =
+      leftScaleValid && rightScaleValid &&
+      leftWeightG >= 0.0f && rightWeightG >= 0.0f &&
+      totalWeightG >= NO_LOAD_THRESHOLD_G;
+
+  float imbalancePercent = 0.0f;
+  if (validDistribution) {
+    imbalancePercent = (differenceG / totalWeightG) * 100.0f;
+  }
+
+  const bool capacityReached = leftScaleValid && rightScaleValid &&
+      (leftWeightG >= LOAD_CELL_CAPACITY_G ||
+       rightWeightG >= LOAD_CELL_CAPACITY_G);
+
+  const bool nearCapacity = leftScaleValid && rightScaleValid &&
+      (leftWeightG >= LOAD_CELL_WARNING_G ||
+       rightWeightG >= LOAD_CELL_WARNING_G);
+
+  const bool detectedWater = waterCalibrationValid &&
+      (waterCoveragePercent >= WATER_DETECT_PERCENT);
+
+  const bool warningWater = waterCalibrationValid &&
+      (waterCoveragePercent >= WATER_WARNING_PERCENT);
+
+  const bool criticalWater = waterCalibrationValid &&
+      (waterCoveragePercent >= WATER_CRITICAL_PERCENT);
+
+  const bool warningTilt = mpuValid &&
+      (fabs(rollDeg) >= TILT_WARNING_DEG ||
+       fabs(pitchDeg) >= TILT_WARNING_DEG);
+
+  const bool criticalTilt = mpuValid &&
+      (fabs(rollDeg) >= TILT_CRITICAL_DEG ||
+       fabs(pitchDeg) >= TILT_CRITICAL_DEG);
+
+  const bool warningImbalance = validDistribution &&
+      (imbalancePercent >= IMBALANCE_WARNING_PERCENT);
+
+  const bool criticalImbalance = validDistribution &&
+      (imbalancePercent >= IMBALANCE_CRITICAL_PERCENT);
+
+  const bool criticalAlert = criticalWater || criticalTilt ||
+      criticalImbalance || capacityReached;
+
+  const bool warningAlert = warningWater || warningTilt ||
+      warningImbalance || nearCapacity;
+
+  // 8. Update buzzer without blocking the other sensors.
+  updateBuzzer(criticalAlert, warningAlert, detectedWater);
+
+  // 9. Print a complete monitoring report once per second.
+  printMonitoringData();
+
+  // Small loop delay; GPS parsing continues on every iteration.
+  delay(2);
+}
